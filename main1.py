@@ -1,5 +1,7 @@
 import os
 import base64
+import hashlib
+import tempfile
 import requests
 import streamlit as st
 import PyPDF2
@@ -13,15 +15,28 @@ APP_TITLE = "Saad AI Chatbot"
 APP_SUBTITLE = "Multi-task AI assistant powered by OpenRouter"
 APP_DEVELOPER = "Eng. Saad Tamer Abo-Elazm"
 
-MAX_PDF_PAGES = 8
-MAX_DOCX_PARAGRAPHS = 250
-MAX_TEXT_CHARS = 12000
-MAX_EXCEL_ROWS = 300
 MAX_HISTORY_MESSAGES = 12
+SMART_TEXT_CHARS = 18000
+SMART_TABLE_SAMPLE_ROWS = 25
+SMART_TABLE_VALUE_COUNTS = 10
+
+IMAGE_INPUT_MODELS = {
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+}
 
 AUDIO_INPUT_MODELS = {
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
 }
+
+IMAGE_FALLBACK_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+]
 
 TASK_MODELS = {
     "🤖 محادثة عامة": {
@@ -73,8 +88,10 @@ TASK_MODELS = {
         },
     },
     "🎤 صوت": {
-        "default": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "default": "nvidia/nemotron-3-super-120b-a12b:free",
         "options": {
+            "nvidia/nemotron-3-super-120b-a12b:free": "Nemotron 3 Super 120B",
+            "openai/gpt-oss-120b:free": "GPT OSS 120B",
             "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": "Nemotron Nano Omni",
         },
     },
@@ -152,7 +169,7 @@ TASK_DESCRIPTIONS = {
     "📝 تلخيص": "تلخيص ملفات، محاضرات، مقالات، ونصوص طويلة.",
     "🌐 ترجمة متخصصة": "ترجمة احترافية مع الحفاظ على المصطلحات التقنية.",
     "🖼️ تحليل صورة": "تحليل صور واستخراج تفاصيل أو نصوص منها.",
-    "🎤 صوت": "التعامل مع محتوى صوتي أو audio transcription.",
+    "🎤 صوت": "تسجيل أو رفع صوت ثم تحويله لنص محليًا أو إرساله كصوت عند دعم الموديل.",
     "📊 تحليل بيانات": "تحليل CSV وExcel واستخراج insights.",
     "🎓 شرح وتعليم": "شرح خطوة بخطوة بأسلوب بسيط.",
     "💼 CV وإيميلات": "كتابة CV، emails، LinkedIn، وcover letters.",
@@ -168,7 +185,7 @@ QUICK_PROMPTS = {
     "📝 تلخيص": "لخص المحتوى في نقاط واضحة ومنظمة.",
     "🌐 ترجمة متخصصة": "ترجم النص ترجمة احترافية مع الحفاظ على المصطلحات.",
     "🖼️ تحليل صورة": "حلل الصورة بالتفصيل واذكر كل الملاحظات.",
-    "🎤 صوت": "استخرج الفكرة الأساسية من المحتوى الصوتي.",
+    "🎤 صوت": "استخرج الكلام أو الفكرة الأساسية من المحتوى الصوتي.",
     "📊 تحليل بيانات": "حلل البيانات واستخرج أهم insights.",
     "🎓 شرح وتعليم": "اشرح الموضوع كأني مبتدئ تمامًا.",
     "💼 CV وإيميلات": "اكتب لي email احترافي قصير ومناسب.",
@@ -179,8 +196,24 @@ QUICK_PROMPTS = {
 }
 
 
+def model_supports_image(model):
+    return model in IMAGE_INPUT_MODELS
+
+
 def model_supports_audio(model):
     return model in AUDIO_INPUT_MODELS
+
+
+def is_image_task(task):
+    return task == "🖼️ تحليل صورة"
+
+
+def is_audio_task(task):
+    return task == "🎤 صوت"
+
+
+def is_file_task(task):
+    return task in ["📝 تلخيص", "📊 تحليل بيانات", "🔍 بحث وتلخيص مقالات"]
 
 
 def get_api_key():
@@ -201,6 +234,40 @@ def format_model_name(model_id):
     models = get_all_model_names()
     model_name = models.get(model_id, model_id)
     return f"{model_name} · {model_id}"
+
+
+def clean_openrouter_error(status_code, message):
+    message_text = str(message)
+    message_lower = message_text.lower()
+
+    if "maximum context length" in message_lower or "context length" in message_lower:
+        return (
+            "الملف أو الرسالة أكبر من نافذة الموديل الحالية. "
+            "سيحتاج التطبيق لاستخدام ملخص أو عينة ذكية من الملف بدل إرسال المحتوى كاملًا."
+        )
+
+    if status_code == 429:
+        return (
+            "الموديل المجاني عليه ضغط أو وصل للـ Rate Limit حاليًا. "
+            "جرّب موديل آخر، أو انتظر قليلًا ثم أعد المحاولة."
+        )
+
+    if status_code == 402 and "audio" in message_lower:
+        return (
+            "تحليل الصوت عبر OpenRouter يحتاج رصيد في الحساب. "
+            "استخدم Local transcription لتحويل الصوت إلى نص ثم إرساله لموديل Text."
+        )
+
+    if status_code == 404 and "image" in message_lower:
+        return "الموديل الحالي لا يدعم إدخال الصور. اختار موديل Vision أو Task تحليل صورة."
+
+    if status_code == 404 and "audio" in message_lower:
+        return "الموديل الحالي لا يدعم إدخال الصوت. استخدم Local transcription أو اختار موديل يدعم Audio Input."
+
+    if status_code == 401:
+        return "مفتاح OpenRouter غير صحيح أو منتهي. راجع API Key وحاول مرة أخرى."
+
+    return f"OpenRouter Error {status_code}: {message}"
 
 
 def call_llm(messages, model, temperature=0.3, max_tokens=1000):
@@ -225,15 +292,16 @@ def call_llm(messages, model, temperature=0.3, max_tokens=1000):
         "X-Title": APP_TITLE,
     }
 
-    response = requests.post(url, json=payload, headers=headers, timeout=90)
+    response = requests.post(url, json=payload, headers=headers, timeout=120)
 
     if response.status_code >= 400:
         try:
             error_data = response.json()
-            error_message = error_data.get("error", {}).get("message", response.text)
+            raw_message = error_data.get("error", {}).get("message", response.text)
         except Exception:
-            error_message = response.text
-        raise RuntimeError(f"OpenRouter Error {response.status_code}: {error_message}")
+            raw_message = response.text
+
+        raise RuntimeError(clean_openrouter_error(response.status_code, raw_message))
 
     data = response.json()
 
@@ -241,6 +309,40 @@ def call_llm(messages, model, temperature=0.3, max_tokens=1000):
         return data["choices"][0]["message"]["content"]
     except Exception:
         raise RuntimeError(f"Unexpected API response: {data}")
+
+
+def call_llm_with_image_fallback(messages, selected_model, temperature=0.3, max_tokens=1000):
+    tried_models = []
+    candidate_models = [selected_model]
+
+    for fallback_model in IMAGE_FALLBACK_MODELS:
+        if fallback_model not in candidate_models:
+            candidate_models.append(fallback_model)
+
+    for model in candidate_models:
+        if not model_supports_image(model):
+            continue
+
+        tried_models.append(model)
+
+        try:
+            answer = call_llm(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return answer, model, tried_models
+        except Exception as e:
+            last_error = str(e)
+            if "ضغط" in last_error or "Rate Limit" in last_error or "429" in last_error:
+                continue
+            raise RuntimeError(last_error)
+
+    raise RuntimeError(
+        "كل موديلات الصور المتاحة فشلت حاليًا. غالبًا موديلات Vision المجانية عليها ضغط. "
+        "جرّب لاحقًا أو استخدم موديل آخر."
+    )
 
 
 def build_system_prompt(task):
@@ -272,7 +374,8 @@ def build_system_prompt(task):
             "Always reply in the same language the user is writing in."
         ),
         "🎤 صوت": (
-            "You are a helpful assistant that processes and responds to audio transcriptions. "
+            "You are a helpful assistant that works with transcribed audio text. "
+            "Extract the meaning, summarize, or answer based on the transcription. "
             "Always reply in the same language the user is writing in."
         ),
         "📊 تحليل بيانات": (
@@ -317,40 +420,95 @@ def build_system_prompt(task):
     return prompts.get(task, prompts["🤖 محادثة عامة"])
 
 
-def validate_text_length(text):
-    if len(text) > MAX_TEXT_CHARS:
-        raise ValueError(f"الملف طويل جدًا. الحد الأقصى المسموح به هو {MAX_TEXT_CHARS} حرف.")
+def smart_text_sample(text, label):
+    if len(text) <= SMART_TEXT_CHARS:
+        return text, None
+
+    half = SMART_TEXT_CHARS // 2
+    sampled_text = (
+        text[:half]
+        + "\n\n...[تم اختصار جزء من المحتوى بسبب حدود نافذة الموديل]...\n\n"
+        + text[-half:]
+    )
+
+    warning = (
+        f"تنبيه: {label} كبير جدًا، لذلك تم استخدام بداية ونهاية المحتوى فقط "
+        "بدل إرسال الملف كاملًا للموديل."
+    )
+
+    return sampled_text, warning
+
+
+def dataframe_summary(df, name):
+    parts = []
+    row_count, col_count = df.shape
+
+    parts.append(f"Dataset name: {name}")
+    parts.append(f"Rows: {row_count}")
+    parts.append(f"Columns: {col_count}")
+    parts.append("Column names:")
+    parts.append(", ".join([str(col) for col in df.columns]))
+
+    parts.append("\nData types:")
+    parts.append(df.dtypes.astype(str).to_string())
+
+    parts.append("\nMissing values:")
+    parts.append(df.isna().sum().to_string())
+
+    numeric_df = df.select_dtypes(include="number")
+
+    if not numeric_df.empty:
+        parts.append("\nNumeric summary:")
+        parts.append(numeric_df.describe().to_string())
+
+    parts.append(f"\nFirst {min(SMART_TABLE_SAMPLE_ROWS, row_count)} rows:")
+    parts.append(df.head(SMART_TABLE_SAMPLE_ROWS).to_string())
+
+    if row_count > SMART_TABLE_SAMPLE_ROWS:
+        parts.append(f"\nLast {min(SMART_TABLE_SAMPLE_ROWS, row_count)} rows:")
+        parts.append(df.tail(SMART_TABLE_SAMPLE_ROWS).to_string())
+
+    object_columns = df.select_dtypes(include=["object", "category", "bool"]).columns[:8]
+
+    for col in object_columns:
+        parts.append(f"\nTop values for column: {col}")
+        parts.append(df[col].value_counts(dropna=False).head(SMART_TABLE_VALUE_COUNTS).to_string())
+
+    warning = (
+        f"تنبيه: الملف {name} يحتوي على {row_count} صف و {col_count} عمود. "
+        "بدل إرسال كل الصفوف للموديل، تم استخدام ملخص ذكي يتضمن الأعمدة، الأنواع، القيم الفارغة، "
+        "إحصائيات رقمية، وأول/آخر عينة من الصفوف."
+    )
+
+    return "\n".join(parts), warning
 
 
 def process_file(uploaded_file):
     uploaded_file.seek(0)
     file_type = uploaded_file.type
     file_name = uploaded_file.name
+    warnings = []
 
     if file_type == "application/pdf":
         pdf_reader = PyPDF2.PdfReader(uploaded_file)
-        page_count = len(pdf_reader.pages)
-
-        if page_count > MAX_PDF_PAGES:
-            raise ValueError(f"ملف PDF يحتوي على {page_count} صفحة. الحد الأقصى المسموح به هو {MAX_PDF_PAGES} صفحات.")
-
         text = ""
-        for page in pdf_reader.pages:
-            page_text = page.extract_text() or ""
-            text += page_text + "\n"
 
-        validate_text_length(text)
-        return f"محتوى الملف ({file_name}):\n{text}"
+        for index, page in enumerate(pdf_reader.pages, start=1):
+            page_text = page.extract_text() or ""
+            text += f"\n\nPage {index}\n{page_text}"
+
+        text, warning = smart_text_sample(text, f"ملف PDF ({file_name})")
+
+        if warning:
+            warnings.append(warning)
+
+        return f"محتوى الملف ({file_name}):\n{text}", warnings
 
     if file_type == "text/csv":
         df = pd.read_csv(uploaded_file)
-
-        if len(df) > MAX_EXCEL_ROWS:
-            raise ValueError(f"الملف يحتوي على {len(df)} صف. الحد الأقصى المسموح به هو {MAX_EXCEL_ROWS} صف.")
-
-        text = df.to_string()
-        validate_text_length(text)
-        return f"محتوى الملف ({file_name}):\n{text}"
+        text, warning = dataframe_summary(df, file_name)
+        warnings.append(warning)
+        return f"ملخص ذكي للملف ({file_name}):\n{text}", warnings
 
     if file_type in [
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -360,29 +518,31 @@ def process_file(uploaded_file):
         result = []
 
         for sheet_name, df in sheets.items():
-            if len(df) > MAX_EXCEL_ROWS:
-                raise ValueError(f"Sheet باسم {sheet_name} يحتوي على {len(df)} صف. الحد الأقصى المسموح به هو {MAX_EXCEL_ROWS} صف.")
-            result.append(f"Sheet: {sheet_name}\n{df.to_string()}")
+            text, warning = dataframe_summary(df, f"{file_name} / Sheet: {sheet_name}")
+            warnings.append(warning)
+            result.append(text)
 
-        text = "\n\n".join(result)
-        validate_text_length(text)
-        return f"محتوى الملف ({file_name}):\n{text}"
+        return f"ملخص ذكي للملف ({file_name}):\n\n" + "\n\n".join(result), warnings
 
     if file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
         doc = Document(uploaded_file)
         paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
-
-        if len(paragraphs) > MAX_DOCX_PARAGRAPHS:
-            raise ValueError(f"ملف Word يحتوي على {len(paragraphs)} فقرة. الحد الأقصى المسموح به هو {MAX_DOCX_PARAGRAPHS} فقرة.")
-
         text = "\n".join(paragraphs)
-        validate_text_length(text)
-        return f"محتوى الملف ({file_name}):\n{text}"
+        text, warning = smart_text_sample(text, f"ملف Word ({file_name})")
+
+        if warning:
+            warnings.append(warning)
+
+        return f"محتوى الملف ({file_name}):\n{text}", warnings
 
     if file_type == "text/plain":
         text = uploaded_file.read().decode("utf-8", errors="ignore")
-        validate_text_length(text)
-        return f"محتوى الملف ({file_name}):\n{text}"
+        text, warning = smart_text_sample(text, f"ملف TXT ({file_name})")
+
+        if warning:
+            warnings.append(warning)
+
+        return f"محتوى الملف ({file_name}):\n{text}", warnings
 
     raise ValueError(f"نوع الملف ({file_type}) مش مدعوم.")
 
@@ -415,6 +575,61 @@ def process_audio(uploaded_audio):
     return encoded_audio, audio_format
 
 
+def transcribe_audio_locally(uploaded_audio):
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        raise RuntimeError(
+            "التفريغ الصوتي المحلي يحتاج تثبيت faster-whisper. "
+            "شغّل الأمر: python -m pip install faster-whisper"
+        )
+
+    uploaded_audio.seek(0)
+    suffix = os.path.splitext(getattr(uploaded_audio, "name", "audio.wav"))[-1] or ".wav"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+        temp_audio.write(uploaded_audio.read())
+        temp_audio_path = temp_audio.name
+
+    try:
+        model_size = os.getenv("WHISPER_MODEL_SIZE", "base")
+        whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, info = whisper_model.transcribe(temp_audio_path)
+        text = " ".join([segment.text.strip() for segment in segments]).strip()
+
+        if not text:
+            raise RuntimeError("لم يتم استخراج نص واضح من الملف الصوتي.")
+
+        return text
+    finally:
+        try:
+            os.remove(temp_audio_path)
+        except Exception:
+            pass
+
+
+def get_attachment_bytes(uploaded_file):
+    if not uploaded_file:
+        return b""
+
+    current_position = uploaded_file.tell()
+
+    try:
+        uploaded_file.seek(0)
+        data = uploaded_file.read()
+        uploaded_file.seek(current_position)
+        return data
+    except Exception:
+        return b""
+
+
+def get_attachment_signature(uploaded_file):
+    data = get_attachment_bytes(uploaded_file)
+    name = getattr(uploaded_file, "name", "recorded_audio")
+    raw = name.encode("utf-8", errors="ignore") + data
+    return hashlib.md5(raw).hexdigest()
+
+
 def get_attachment_names(uploaded_file=None, uploaded_image=None, uploaded_audio=None):
     attachments = []
 
@@ -431,28 +646,96 @@ def get_attachment_names(uploaded_file=None, uploaded_image=None, uploaded_audio
     return attachments
 
 
-def build_user_content(user_input, model, uploaded_file=None, uploaded_image=None, uploaded_audio=None):
+def get_active_attachments(task, uploaded_file=None, uploaded_image=None, uploaded_audio=None):
+    active_file = None
+    active_image = None
+    active_audio = None
+    ignored = []
+
+    if is_image_task(task):
+        active_image = uploaded_image
+        if uploaded_file:
+            ignored.append("تم تجاهل الملف لأن المهمة الحالية مخصصة لتحليل الصور.")
+        if uploaded_audio:
+            ignored.append("تم تجاهل الصوت لأن المهمة الحالية مخصصة لتحليل الصور.")
+
+    elif is_audio_task(task):
+        active_audio = uploaded_audio
+        if uploaded_file:
+            ignored.append("تم تجاهل الملف لأن المهمة الحالية مخصصة للصوت.")
+        if uploaded_image:
+            ignored.append("تم تجاهل الصورة لأن المهمة الحالية مخصصة للصوت.")
+
+    elif is_file_task(task):
+        active_file = uploaded_file
+        if uploaded_image:
+            ignored.append("تم تجاهل الصورة لأن المهمة الحالية مخصصة للملفات أو البيانات.")
+        if uploaded_audio:
+            ignored.append("تم تجاهل الصوت لأن المهمة الحالية مخصصة للملفات أو البيانات.")
+
+    else:
+        active_file = uploaded_file
+        if uploaded_image:
+            ignored.append("الصورة مرفوعة لكنها لن تُستخدم إلا مع Task تحليل صورة.")
+        if uploaded_audio:
+            ignored.append("الصوت مرفوع لكنه لن يُستخدم إلا مع Task صوت.")
+
+    return active_file, active_image, active_audio, ignored
+
+
+def build_user_content(user_input, task, model, uploaded_file=None, uploaded_image=None, uploaded_audio=None, audio_mode="local"):
+    active_file, active_image, active_audio, ignored = get_active_attachments(
+        task=task,
+        uploaded_file=uploaded_file,
+        uploaded_image=uploaded_image,
+        uploaded_audio=uploaded_audio,
+    )
+
     text_parts = []
 
-    if uploaded_file:
-        text_parts.append(process_file(uploaded_file))
+    if ignored:
+        text_parts.append("تنبيهات المرفقات:\n" + "\n".join(ignored))
+
+    if active_file:
+        file_content, file_warnings = process_file(active_file)
+
+        if file_warnings:
+            text_parts.append("تحذيرات معالجة الملف:\n" + "\n".join(file_warnings))
+
+        text_parts.append(file_content)
+
+    if active_audio:
+        if audio_mode == "local":
+            transcript = transcribe_audio_locally(active_audio)
+            text_parts.append(f"النص المستخرج من الصوت:\n{transcript}")
+        else:
+            if not model_supports_audio(model):
+                raise ValueError(
+                    "الموديل الحالي لا يدعم إدخال الصوت. "
+                    "اختار موديل يدعم Audio Input أو استخدم Local transcription."
+                )
 
     text_parts.append(f"سؤال المستخدم:\n{user_input}")
     final_text = "\n\n".join(text_parts)
 
-    if uploaded_audio and not model_supports_audio(model):
+    if active_image and not model_supports_image(model):
         raise ValueError(
-            "الموديل الحالي لا يدعم إدخال الصوت. "
-            "اختار Task الصوت أو موديل يدعم Audio Input، أو حوّل الصوت لنص وابعت النص."
+            "الموديل الحالي لا يدعم إدخال الصور. "
+            "اختار Task تحليل صورة أو موديل يدعم Image Input."
         )
 
-    if not uploaded_image and not uploaded_audio:
+    final_text, warning = smart_text_sample(final_text, "الرسالة النهائية المرسلة للموديل")
+
+    if warning:
+        final_text = f"{warning}\n\n{final_text}"
+
+    if not active_image and not (active_audio and audio_mode == "openrouter"):
         return final_text
 
     user_content = []
 
-    if uploaded_image:
-        encoded_image, mime_type = process_image(uploaded_image)
+    if active_image:
+        encoded_image, mime_type = process_image(active_image)
         user_content.append(
             {
                 "type": "image_url",
@@ -462,8 +745,8 @@ def build_user_content(user_input, model, uploaded_file=None, uploaded_image=Non
             }
         )
 
-    if uploaded_audio:
-        encoded_audio, audio_format = process_audio(uploaded_audio)
+    if active_audio and audio_mode == "openrouter":
+        encoded_audio, audio_format = process_audio(active_audio)
         user_content.append(
             {
                 "type": "input_audio",
@@ -484,7 +767,16 @@ def build_user_content(user_input, model, uploaded_file=None, uploaded_image=Non
     return user_content
 
 
-def build_messages(user_input, task, model, uploaded_file=None, uploaded_image=None, uploaded_audio=None, chat_history=None):
+def build_messages(
+    user_input,
+    task,
+    model,
+    uploaded_file=None,
+    uploaded_image=None,
+    uploaded_audio=None,
+    chat_history=None,
+    audio_mode="local",
+):
     messages = [
         {
             "role": "system",
@@ -510,10 +802,12 @@ def build_messages(user_input, task, model, uploaded_file=None, uploaded_image=N
             "role": "user",
             "content": build_user_content(
                 user_input=user_input,
+                task=task,
                 model=model,
                 uploaded_file=uploaded_file,
                 uploaded_image=uploaded_image,
                 uploaded_audio=uploaded_audio,
+                audio_mode=audio_mode,
             ),
         }
     )
@@ -531,6 +825,7 @@ def generate_answer(
     uploaded_image=None,
     uploaded_audio=None,
     chat_history=None,
+    audio_mode="local",
 ):
     messages = build_messages(
         user_input=user_input,
@@ -540,14 +835,26 @@ def generate_answer(
         uploaded_image=uploaded_image,
         uploaded_audio=uploaded_audio,
         chat_history=chat_history,
+        audio_mode=audio_mode,
     )
 
-    return call_llm(
+    if is_image_task(task) and uploaded_image:
+        answer, final_model, tried_models = call_llm_with_image_fallback(
+            messages=messages,
+            selected_model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return answer, final_model
+
+    answer = call_llm(
         messages=messages,
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
     )
+
+    return answer, model
 
 
 def init_session_state():
@@ -557,6 +864,9 @@ def init_session_state():
         "current_model": TASK_MODELS["🤖 محادثة عامة"]["default"],
         "quick_prompt": None,
         "manual_api_key": "",
+        "audio_mode": "local",
+        "auto_process_recorded_audio": True,
+        "last_auto_audio_signature": "",
     }
 
     for key, value in defaults.items():
@@ -567,6 +877,92 @@ def init_session_state():
 def reset_chat():
     st.session_state.messages = []
     st.session_state.quick_prompt = None
+    st.session_state.last_auto_audio_signature = ""
+
+
+def run_chat_turn(
+    user_input,
+    task,
+    model,
+    temperature,
+    max_tokens,
+    uploaded_file=None,
+    uploaded_image=None,
+    uploaded_audio=None,
+    audio_mode="local",
+):
+    active_file, active_image, active_audio, ignored = get_active_attachments(
+        task=task,
+        uploaded_file=uploaded_file,
+        uploaded_image=uploaded_image,
+        uploaded_audio=uploaded_audio,
+    )
+
+    attachments = get_attachment_names(active_file, active_image, active_audio)
+    previous_messages = st.session_state.messages.copy()
+
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": user_input,
+            "task": task,
+            "model": model,
+            "attachments": attachments,
+        }
+    )
+
+    with st.chat_message("user", avatar="🧑‍💻"):
+        st.markdown(user_input)
+
+        if attachments:
+            chips = "".join([f'<span class="attachment-chip">{item}</span>' for item in attachments])
+            st.markdown(chips, unsafe_allow_html=True)
+
+    try:
+        with st.chat_message("assistant", avatar="🤖"):
+            with st.spinner("Thinking..."):
+                answer, used_model = generate_answer(
+                    user_input=user_input,
+                    task=task,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    uploaded_file=uploaded_file,
+                    uploaded_image=uploaded_image,
+                    uploaded_audio=uploaded_audio,
+                    chat_history=previous_messages,
+                    audio_mode=audio_mode,
+                )
+
+                st.markdown(answer)
+                st.markdown(
+                    f"<div class='message-meta'>Task: {task} · Model: {used_model}</div>",
+                    unsafe_allow_html=True,
+                )
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "task": task,
+                "model": used_model,
+                "attachments": [],
+            }
+        )
+
+    except Exception as e:
+        error_message = f"Error: {str(e)}"
+        st.error(error_message)
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": error_message,
+                "task": task,
+                "model": model,
+                "attachments": [],
+            }
+        )
 
 
 def main():
@@ -580,10 +976,35 @@ def main():
     apply_custom_css()
     init_session_state()
 
-    task, model, temperature, max_tokens, uploaded_file, uploaded_image, uploaded_audio = render_sidebar()
+    task, model, temperature, max_tokens, uploaded_file, uploaded_image, uploaded_audio, audio_mode, audio_source = render_sidebar()
 
     render_header(task, model)
     render_chat_messages()
+
+    should_auto_process_audio = (
+        is_audio_task(task)
+        and audio_source == "recorded"
+        and uploaded_audio is not None
+        and st.session_state.auto_process_recorded_audio
+    )
+
+    if should_auto_process_audio:
+        audio_signature = get_attachment_signature(uploaded_audio)
+
+        if audio_signature != st.session_state.last_auto_audio_signature:
+            st.session_state.last_auto_audio_signature = audio_signature
+            run_chat_turn(
+                user_input="حلل التسجيل الصوتي أو استخرج الكلام الموجود فيه.",
+                task=task,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                uploaded_file=uploaded_file,
+                uploaded_image=uploaded_image,
+                uploaded_audio=uploaded_audio,
+                audio_mode=audio_mode,
+            )
+            st.rerun()
 
     user_input = st.chat_input("Type your question here...")
 
@@ -592,70 +1013,17 @@ def main():
         st.session_state.quick_prompt = None
 
     if user_input:
-        attachments = get_attachment_names(uploaded_file, uploaded_image, uploaded_audio)
-        previous_messages = st.session_state.messages.copy()
-
-        st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": user_input,
-                "task": task,
-                "model": model,
-                "attachments": attachments,
-            }
+        run_chat_turn(
+            user_input=user_input,
+            task=task,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            uploaded_file=uploaded_file,
+            uploaded_image=uploaded_image,
+            uploaded_audio=uploaded_audio,
+            audio_mode=audio_mode,
         )
-
-        with st.chat_message("user", avatar="🧑‍💻"):
-            st.markdown(user_input)
-
-            if attachments:
-                chips = "".join([f'<span class="attachment-chip">{item}</span>' for item in attachments])
-                st.markdown(chips, unsafe_allow_html=True)
-
-        try:
-            with st.chat_message("assistant", avatar="🤖"):
-                with st.spinner("Thinking..."):
-                    answer = generate_answer(
-                        user_input=user_input,
-                        task=task,
-                        model=model,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        uploaded_file=uploaded_file,
-                        uploaded_image=uploaded_image,
-                        uploaded_audio=uploaded_audio,
-                        chat_history=previous_messages,
-                    )
-
-                    st.markdown(answer)
-                    st.markdown(
-                        f"<div class='message-meta'>Task: {task} · Model: {model}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": answer,
-                    "task": task,
-                    "model": model,
-                    "attachments": [],
-                }
-            )
-
-        except Exception as e:
-            error_message = f"Error: {str(e)}"
-            st.error(error_message)
-
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": error_message,
-                    "task": task,
-                    "model": model,
-                    "attachments": [],
-                }
-            )
 
 
 def apply_custom_css():
@@ -911,10 +1279,15 @@ def apply_custom_css():
         }
 
         [data-testid="stAudioInput"] {
-            background: rgba(255,255,255,0.055) !important;
-            border: 1px solid var(--card-border) !important;
+            background: rgba(255,255,255,0.035) !important;
+            border: 1px solid rgba(16,163,127,0.35) !important;
             border-radius: 16px !important;
             padding: 10px !important;
+            min-height: 76px !important;
+        }
+
+        [data-testid="stAudioInput"] * {
+            color: var(--text-main) !important;
         }
 
         [data-testid="stAudioInput"] button {
@@ -922,6 +1295,7 @@ def apply_custom_css():
             color: white !important;
             border-radius: 999px !important;
             border: none !important;
+            opacity: 1 !important;
         }
 
         .stAlert {
@@ -1042,6 +1416,12 @@ def render_sidebar():
 
         st.session_state.current_model = model
 
+        if is_image_task(task) and not model_supports_image(model):
+            st.warning("الموديل الحالي لا يدعم الصور. اختار موديل Vision من القائمة.")
+
+        if is_audio_task(task) and not model_supports_audio(model):
+            st.info("الصوت سيتم التعامل معه بالتفريغ المحلي إن كانت faster-whisper مثبتة.")
+
         temperature = st.slider(
             "Temperature",
             min_value=0.0,
@@ -1066,7 +1446,7 @@ def render_sidebar():
         )
 
         st.caption(
-            f"PDF بحد أقصى {MAX_PDF_PAGES} صفحات. Excel/CSV بحد أقصى {MAX_EXCEL_ROWS} صف. Word بحد أقصى {MAX_DOCX_PARAGRAPHS} فقرة. TXT بحد أقصى {MAX_TEXT_CHARS} حرف."
+            "ارفع ملف PDF أو CSV أو Excel أو Word أو TXT. الملفات الكبيرة سيتم التعامل معها بعينة أو ملخص ذكي بسبب حدود الموديل."
         )
 
         uploaded_image = st.file_uploader(
@@ -1074,29 +1454,64 @@ def render_sidebar():
             type=["png", "jpg", "jpeg", "webp"],
         )
 
-        st.caption("ارفع صورة واضحة بصيغة PNG أو JPG أو JPEG أو WEBP.")
+        st.caption("ارفع صورة لتحليلها أو استخراج التفاصيل منها. جودة الصورة تؤثر على دقة التحليل.")
 
         uploaded_audio_file = st.file_uploader(
             "Upload Audio",
             type=["mp3", "wav", "m4a", "ogg", "webm"],
         )
 
-        st.caption("ارفع ملف صوتي قصير وواضح. دعم الصوت يعتمد على الموديل المختار.")
+        st.caption("ارفع ملف صوتي أو سجل صوتك مباشرة. يمكن تفريغه محليًا ثم إرسال النص للموديل.")
+
+        audio_mode = "local"
+
+        if is_audio_task(task):
+            audio_mode = st.radio(
+                "Audio Processing",
+                options=["local", "openrouter"],
+                format_func=lambda value: "Local transcription" if value == "local" else "OpenRouter audio input",
+                index=0,
+            )
+
+            st.session_state.auto_process_recorded_audio = st.checkbox(
+                "Auto process recorded audio",
+                value=st.session_state.get("auto_process_recorded_audio", True),
+            )
+
+            if audio_mode == "local":
+                st.caption("بعد انتهاء التسجيل، سيتم تفريغ الصوت محليًا وإرساله للشات تلقائيًا.")
+            else:
+                st.caption("قد يحتاج OpenRouter balance لتشغيل Audio Input.")
 
         recorded_audio = None
 
         if hasattr(st, "audio_input"):
             recorded_audio = st.audio_input("Record Audio")
-            st.caption("اضغط على زر الميكروفون داخل الصندوق واسمح للمتصفح باستخدام الميكروفون.")
+            st.caption("اضغط على زر الميكروفون وسجل صوتك. بعد انتهاء التسجيل سيتم تشغيله تلقائيًا لو Auto process مفعّل.")
         else:
             st.caption("تسجيل الصوت المباشر غير مدعوم في نسخة Streamlit الحالية. حدّث Streamlit.")
 
         uploaded_audio = recorded_audio or uploaded_audio_file
+        audio_source = "recorded" if recorded_audio else "uploaded" if uploaded_audio_file else None
 
-        if uploaded_audio and not model_supports_audio(model):
-            st.warning("الموديل الحالي لا يدعم الصوت. اختار Task 🎤 صوت أو موديل يدعم Audio Input.")
+        active_file, active_image, active_audio, ignored = get_active_attachments(
+            task=task,
+            uploaded_file=uploaded_file,
+            uploaded_image=uploaded_image,
+            uploaded_audio=uploaded_audio,
+        )
 
-        attachments = get_attachment_names(uploaded_file, uploaded_image, uploaded_audio)
+        if ignored:
+            for warning_message in ignored:
+                st.caption(warning_message)
+
+        if active_image and not model_supports_image(model):
+            st.warning("الموديل الحالي لا يدعم Image Input. الطلب لن يُرسل بهذا الموديل.")
+
+        if active_audio and audio_mode == "openrouter" and not model_supports_audio(model):
+            st.warning("الموديل الحالي لا يدعم Audio Input. استخدم Local transcription أو اختر موديل يدعم الصوت.")
+
+        attachments = get_attachment_names(active_file, active_image, active_audio)
 
         if attachments:
             chips = "".join([f'<span class="attachment-chip">{item}</span>' for item in attachments])
@@ -1136,7 +1551,7 @@ def render_sidebar():
 
         st.caption(f"Developer: {APP_DEVELOPER}")
 
-    return task, model, temperature, max_tokens, uploaded_file, uploaded_image, uploaded_audio
+    return task, model, temperature, max_tokens, uploaded_file, uploaded_image, uploaded_audio, audio_mode, audio_source
 
 
 def render_empty_state():
